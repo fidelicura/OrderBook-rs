@@ -251,8 +251,8 @@ pub use orderbook::iterators::LevelInfo;
 pub use orderbook::manager::{BookManager, BookManagerStd, BookManagerTokio};
 pub use orderbook::market_impact::{MarketImpact, OrderSimulation};
 pub use orderbook::sequencer::{
-    Journal, JournalEntry, JournalError, JournalReadIter, SequencerCommand, SequencerEvent,
-    SequencerResult,
+    InMemoryJournal, Journal, JournalEntry, JournalError, JournalReadIter, ReplayEngine,
+    ReplayError, SequencerCommand, SequencerEvent, SequencerResult, snapshots_match,
 };
 pub use orderbook::serialization::{EventSerializer, JsonEventSerializer, SerializationError};
 pub use orderbook::snapshot::{EnrichedSnapshot, MetricFlags};
