@@ -27,6 +27,22 @@ use pricelevel::Id;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// Returns the current time in nanoseconds since the Unix epoch.
+///
+/// Returns `0` if the system clock is before the Unix epoch.
+/// If the duration exceeds `u64::MAX` nanoseconds (~584 years from epoch)
+/// the value is capped at `u64::MAX`. This matches the fallback used
+/// by [`OrderStateTracker::purge_terminal_older_than`] so comparisons
+/// remain consistent.
+#[inline]
+fn nanos_since_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
 
 /// Reason for order cancellation.
 ///
@@ -212,6 +228,13 @@ const DEFAULT_RETENTION_CAPACITY: usize = 10_000;
 pub struct OrderStateTracker {
     /// Current status of each tracked order.
     states: DashMap<Id, OrderStatus>,
+    /// Timestamped transition history per order: `(timestamp_ns, status)`.
+    ///
+    /// History grows linearly with transitions for each order (e.g. many
+    /// partial fills). Entries are evicted together with their state both
+    /// by capacity-based eviction in [`enqueue_terminal`](Self::enqueue_terminal)
+    /// and by [`purge_terminal_older_than`](Self::purge_terminal_older_than).
+    history: DashMap<Id, Vec<(u64, OrderStatus)>>,
     /// FIFO queue of terminal-state order IDs for eviction.
     terminal_queue: Mutex<VecDeque<Id>>,
     /// Maximum number of terminal-state entries to retain.
@@ -242,6 +265,7 @@ impl OrderStateTracker {
     pub fn new() -> Self {
         Self {
             states: DashMap::new(),
+            history: DashMap::new(),
             terminal_queue: Mutex::new(VecDeque::new()),
             retention_capacity: DEFAULT_RETENTION_CAPACITY,
             listener: None,
@@ -258,6 +282,7 @@ impl OrderStateTracker {
     pub fn with_capacity(retention_capacity: usize) -> Self {
         Self {
             states: DashMap::new(),
+            history: DashMap::new(),
             terminal_queue: Mutex::new(VecDeque::new()),
             retention_capacity,
             listener: None,
@@ -310,6 +335,13 @@ impl OrderStateTracker {
 
         self.states.insert(order_id, new_status.clone());
 
+        // Record timestamped history
+        let ts = nanos_since_epoch();
+        self.history
+            .entry(order_id)
+            .or_default()
+            .push((ts, new_status.clone()));
+
         // Notify listener
         if let Some(ref listener) = self.listener {
             let old = old_status.as_ref().unwrap_or(&new_status);
@@ -334,15 +366,108 @@ impl OrderStateTracker {
                     {
                         drop(entry);
                         self.states.remove(&evicted_id);
+                        self.history.remove(&evicted_id);
                     }
                 }
             }
         }
     }
 
+    /// Returns the full transition history for an order.
+    ///
+    /// Each entry is a `(timestamp_ns, OrderStatus)` pair in chronological
+    /// order. Returns `None` if the order ID was never submitted.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use orderbook_rs::orderbook::order_state::{OrderStateTracker, OrderStatus};
+    /// use pricelevel::Id;
+    ///
+    /// let tracker = OrderStateTracker::new();
+    /// let id = Id::new_uuid();
+    /// tracker.transition(id, OrderStatus::Open);
+    /// let history = tracker.get_history(id);
+    /// assert!(history.is_some());
+    /// assert_eq!(history.as_ref().map(|h| h.len()), Some(1));
+    /// ```
+    #[must_use]
+    pub fn get_history(&self, order_id: Id) -> Option<Vec<(u64, OrderStatus)>> {
+        self.history
+            .get(&order_id)
+            .map(|entry| entry.value().clone())
+    }
+
+    /// Returns the number of orders currently in an active state
+    /// (`Open` or `PartiallyFilled`).
+    #[must_use]
+    pub fn active_count(&self) -> usize {
+        self.states.iter().filter(|e| e.value().is_active()).count()
+    }
+
+    /// Returns the number of orders currently in a terminal state
+    /// (`Filled`, `Cancelled`, or `Rejected`).
+    #[must_use]
+    pub fn terminal_count(&self) -> usize {
+        self.states
+            .iter()
+            .filter(|e| e.value().is_terminal())
+            .count()
+    }
+
+    /// Remove all terminal-state entries whose last transition is older
+    /// than `older_than` ago.
+    ///
+    /// Active orders (`Open`, `PartiallyFilled`) are never purged.
+    /// This is useful for bounded memory management in long-running
+    /// processes.
+    ///
+    /// # Arguments
+    ///
+    /// * `older_than` — entries with a last-transition timestamp older
+    ///   than `now - older_than` nanoseconds are removed.
+    ///
+    /// # Returns
+    ///
+    /// The number of entries purged.
+    pub fn purge_terminal_older_than(&self, older_than: Duration) -> usize {
+        let cutoff = nanos_since_epoch()
+            .saturating_sub(u64::try_from(older_than.as_nanos()).unwrap_or(u64::MAX));
+
+        let mut purged = 0usize;
+        // Collect IDs to remove (avoid holding DashMap iterators during mutation)
+        let to_remove: Vec<Id> = self
+            .states
+            .iter()
+            .filter_map(|entry| {
+                let id = *entry.key();
+                let status = entry.value();
+                if !status.is_terminal() {
+                    return None;
+                }
+                // Check the last history entry's timestamp
+                let is_old = self
+                    .history
+                    .get(&id)
+                    .and_then(|h| h.value().last().map(|(ts, _)| *ts < cutoff))
+                    .unwrap_or(false);
+                if is_old { Some(id) } else { None }
+            })
+            .collect();
+
+        for id in to_remove {
+            self.states.remove(&id);
+            self.history.remove(&id);
+            purged = purged.saturating_add(1);
+        }
+
+        purged
+    }
+
     /// Remove all tracked states. Useful for testing or book reset.
     pub fn clear(&self) {
         self.states.clear();
+        self.history.clear();
         if let Ok(mut queue) = self.terminal_queue.lock() {
             queue.clear();
         }

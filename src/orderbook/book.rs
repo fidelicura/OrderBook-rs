@@ -681,6 +681,57 @@ where
         self.order_state_tracker.as_ref()
     }
 
+    /// Returns the full transition history for an order.
+    ///
+    /// Each entry is a `(timestamp_ns, OrderStatus)` pair in chronological
+    /// order. Returns `None` if no tracker is configured or the order ID
+    /// was never submitted.
+    #[must_use]
+    pub fn get_order_history(
+        &self,
+        order_id: Id,
+    ) -> Option<Vec<(u64, super::order_state::OrderStatus)>> {
+        self.order_state_tracker
+            .as_ref()
+            .and_then(|t| t.get_history(order_id))
+    }
+
+    /// Returns the number of orders currently in an active state
+    /// (`Open` or `PartiallyFilled`).
+    ///
+    /// Returns `0` if no tracker is configured.
+    #[must_use]
+    pub fn active_order_count(&self) -> usize {
+        self.order_state_tracker
+            .as_ref()
+            .map(|t| t.active_count())
+            .unwrap_or(0)
+    }
+
+    /// Returns the number of orders currently in a terminal state
+    /// (`Filled`, `Cancelled`, or `Rejected`).
+    ///
+    /// Returns `0` if no tracker is configured.
+    #[must_use]
+    pub fn terminal_order_count(&self) -> usize {
+        self.order_state_tracker
+            .as_ref()
+            .map(|t| t.terminal_count())
+            .unwrap_or(0)
+    }
+
+    /// Remove all terminal-state entries whose last transition is older
+    /// than `older_than` ago.
+    ///
+    /// Active orders are never purged. Returns the number of entries
+    /// removed, or `0` if no tracker is configured.
+    pub fn purge_terminal_states(&self, older_than: std::time::Duration) -> usize {
+        self.order_state_tracker
+            .as_ref()
+            .map(|t| t.purge_terminal_older_than(older_than))
+            .unwrap_or(0)
+    }
+
     /// Create a new order book for the given symbol with Self-Trade Prevention.
     ///
     /// # Arguments

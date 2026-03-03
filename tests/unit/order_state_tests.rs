@@ -426,4 +426,209 @@ mod tests_order_state {
         // The resting ask should still be Open
         assert_eq!(book.order_status(ask_id), Some(OrderStatus::Open));
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // get_order_history
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn get_order_history_returns_transitions_in_order() {
+        let book = book_with_tracker("TEST");
+
+        // Place a small resting ask
+        book.add_limit_order(Id::new_uuid(), 100, 3, Side::Sell, TimeInForce::Gtc, None)
+            .expect("add ask");
+
+        // Buy partially matches, then rests
+        let bid_id = Id::new_uuid();
+        book.add_limit_order(bid_id, 100, 10, Side::Buy, TimeInForce::Gtc, None)
+            .expect("add bid");
+
+        // Cancel the resting remainder
+        book.cancel_order(bid_id).expect("cancel");
+
+        let history = book.get_order_history(bid_id);
+        assert!(history.is_some());
+        let history = history.expect("history exists");
+
+        // Should have 2 entries: PartiallyFilled then Cancelled
+        assert_eq!(
+            history.len(),
+            2,
+            "expected 2 transitions, got {}",
+            history.len()
+        );
+
+        // First transition: PartiallyFilled
+        assert!(
+            matches!(history[0].1, OrderStatus::PartiallyFilled { .. }),
+            "first should be PartiallyFilled, got: {:?}",
+            history[0].1
+        );
+
+        // Second transition: Cancelled
+        assert!(
+            matches!(history[1].1, OrderStatus::Cancelled { .. }),
+            "second should be Cancelled, got: {:?}",
+            history[1].1
+        );
+
+        // Timestamps should be monotonic
+        assert!(history[1].0 >= history[0].0);
+    }
+
+    #[test]
+    fn get_order_history_returns_none_for_unknown() {
+        let book = book_with_tracker("TEST");
+        assert!(book.get_order_history(Id::new_uuid()).is_none());
+    }
+
+    #[test]
+    fn get_order_history_no_tracker_returns_none() {
+        let book = DefaultOrderBook::new("TEST");
+        let id = Id::new_uuid();
+        book.add_limit_order(id, 100, 10, Side::Buy, TimeInForce::Gtc, None)
+            .expect("add");
+        assert!(book.get_order_history(id).is_none());
+    }
+
+    #[test]
+    fn get_order_history_single_transition_open() {
+        let book = book_with_tracker("TEST");
+        let id = Id::new_uuid();
+        book.add_limit_order(id, 100, 10, Side::Buy, TimeInForce::Gtc, None)
+            .expect("add");
+
+        let history = book.get_order_history(id);
+        assert!(history.is_some());
+        let history = history.expect("history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].1, OrderStatus::Open);
+        assert!(history[0].0 > 0, "timestamp should be non-zero");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // active_order_count / terminal_order_count
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn active_and_terminal_counts() {
+        let book = book_with_tracker("TEST");
+
+        assert_eq!(book.active_order_count(), 0);
+        assert_eq!(book.terminal_order_count(), 0);
+
+        // Add 3 resting orders
+        let id1 = Id::new_uuid();
+        let id2 = Id::new_uuid();
+        let id3 = Id::new_uuid();
+        book.add_limit_order(id1, 100, 10, Side::Buy, TimeInForce::Gtc, None)
+            .expect("add");
+        book.add_limit_order(id2, 99, 10, Side::Buy, TimeInForce::Gtc, None)
+            .expect("add");
+        book.add_limit_order(id3, 200, 10, Side::Sell, TimeInForce::Gtc, None)
+            .expect("add");
+
+        assert_eq!(book.active_order_count(), 3);
+        assert_eq!(book.terminal_order_count(), 0);
+
+        // Cancel one
+        book.cancel_order(id1).expect("cancel");
+
+        assert_eq!(book.active_order_count(), 2);
+        assert_eq!(book.terminal_order_count(), 1);
+
+        // Fill one via aggressive order
+        let aggressive_id = Id::new_uuid();
+        book.add_limit_order(aggressive_id, 200, 10, Side::Buy, TimeInForce::Gtc, None)
+            .expect("aggressive buy");
+
+        // id3 (ask at 200) should be Filled, aggressive_id should be Filled
+        // id2 still Open
+        assert_eq!(book.active_order_count(), 1);
+        assert!(book.terminal_order_count() >= 3);
+    }
+
+    #[test]
+    fn counts_zero_without_tracker() {
+        let book = DefaultOrderBook::new("TEST");
+        assert_eq!(book.active_order_count(), 0);
+        assert_eq!(book.terminal_order_count(), 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // purge_terminal_states
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn purge_terminal_states_removes_old_entries() {
+        let book = book_with_tracker("TEST");
+
+        // Add and cancel orders
+        let id1 = Id::new_uuid();
+        let id2 = Id::new_uuid();
+        book.add_limit_order(id1, 100, 10, Side::Buy, TimeInForce::Gtc, None)
+            .expect("add");
+        book.add_limit_order(id2, 200, 10, Side::Sell, TimeInForce::Gtc, None)
+            .expect("add");
+        book.cancel_order(id1).expect("cancel");
+        book.cancel_order(id2).expect("cancel");
+
+        assert_eq!(book.terminal_order_count(), 2);
+
+        // Purge with zero duration → should remove all terminal entries
+        // (they were created in the past, any non-zero cutoff should catch them)
+        let purged = book.purge_terminal_states(std::time::Duration::from_secs(0));
+        assert_eq!(purged, 2);
+        assert_eq!(book.terminal_order_count(), 0);
+
+        // Status should now be None (purged)
+        assert!(book.order_status(id1).is_none());
+        assert!(book.order_status(id2).is_none());
+    }
+
+    #[test]
+    fn purge_terminal_states_keeps_recent_entries() {
+        let book = book_with_tracker("TEST");
+
+        let id = Id::new_uuid();
+        book.add_limit_order(id, 100, 10, Side::Buy, TimeInForce::Gtc, None)
+            .expect("add");
+        book.cancel_order(id).expect("cancel");
+
+        // Purge with very long duration → nothing should be removed
+        let purged = book.purge_terminal_states(std::time::Duration::from_secs(3600));
+        assert_eq!(purged, 0);
+        assert!(book.order_status(id).is_some());
+    }
+
+    #[test]
+    fn purge_terminal_states_does_not_affect_active() {
+        let book = book_with_tracker("TEST");
+
+        let active_id = Id::new_uuid();
+        let terminal_id = Id::new_uuid();
+        book.add_limit_order(active_id, 100, 10, Side::Buy, TimeInForce::Gtc, None)
+            .expect("add");
+        book.add_limit_order(terminal_id, 200, 10, Side::Sell, TimeInForce::Gtc, None)
+            .expect("add");
+        book.cancel_order(terminal_id).expect("cancel");
+
+        // Purge all terminal
+        let purged = book.purge_terminal_states(std::time::Duration::from_secs(0));
+        assert_eq!(purged, 1);
+
+        // Active order should still be tracked
+        assert_eq!(book.order_status(active_id), Some(OrderStatus::Open));
+        assert_eq!(book.active_order_count(), 1);
+    }
+
+    #[test]
+    fn purge_terminal_states_zero_without_tracker() {
+        let book = DefaultOrderBook::new("TEST");
+        assert_eq!(
+            book.purge_terminal_states(std::time::Duration::from_secs(0)),
+            0
+        );
+    }
 }
