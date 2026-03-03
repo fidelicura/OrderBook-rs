@@ -1,4 +1,6 @@
 mod book_coverage_tests;
+#[cfg(feature = "journal")]
+mod filejournal_edge_case_tests;
 mod implied_volatility_tests;
 mod mass_cancel_tests;
 mod matching_coverage_tests;
